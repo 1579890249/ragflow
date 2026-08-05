@@ -1,144 +1,144 @@
-# Document-Scoped High-Recall Candidate Allocation Design
+# 面向文档范围的高召回候选分配设计
 
-## Context
+## 背景
 
-The high-recall path currently discovers documents with a literal query term, searches those documents for answer terms, merges the results with global full-query and fallback channels, and reranks a bounded candidate set.
+当前高召回链路先使用问题中的字面检索词发现文档，再在这些文档内检索答案词，同时保留完整问题检索和全局回退检索，合并多个通道的结果后，在有界候选集中执行重排。
 
-A production comparison exposed a candidate-allocation failure:
+生产环境中的对比验证暴露了一个候选分配问题：
 
-- With `rerank_top_n=64`, document discovery found both relevant `53-80` reports, but one report contributed only its identity/brand chunk. Its answer table did not enter the rerank set.
-- The request had 82 candidate reports and only 64 rerank slots. The existing report-first selection consumed the entire budget before complementary chunks from the same report could be selected.
-- With `rerank_top_n=128`, the missing answer table appeared, but latency increased from about 4.3 seconds to more than 7 seconds because both the per-channel pool and rerank batch doubled.
-- The existing candidate preparation caps each logical report at six chunks, and final diversification caps it at three. A hard document-level cap is incorrect when more than three distinct chunks are strongly relevant.
+- 当 `rerank_top_n=64` 时，文档发现已经找到两份相关的 `53-80` 报告，但其中一份报告只贡献了规格和品牌片段，答案表格没有进入重排集合。
+- 该请求共有 82 份候选报告，却只有 64 个重排名额。现有的“报告覆盖优先”策略在选择同一报告的互补片段前就已经耗尽全部预算。
+- 当 `rerank_top_n=128` 时，缺失的答案表格能够返回，但由于每个检索通道的候选池和重排批次同时扩大一倍，耗时从约 4.3 秒增加到 7 秒以上。
+- 当前候选准备阶段将每个逻辑报告限制为最多 6 个片段，最终多样化阶段又限制为最多 3 个片段。当同一文档存在超过 3 个不同且强相关的片段时，这种文档级硬上限并不合理。
 
-The problem is general: an entity or identifier may occur in one chunk while the requested facts occur in other chunks of the same document. The solution must not contain tire brands, sizes, years, domain dictionaries, or other business-specific rules.
+这是一个通用问题：实体或标识符可能出现在一个片段中，而问题所需事实出现在同一文档的其他片段中。解决方案不得包含轮胎品牌、规格、年份、领域词典或其他业务专用规则。
 
-## Goals
+## 目标
 
-1. Preserve at least one answer-bearing candidate from documents identified by literal document discovery or explicit `doc_ids`.
-2. Allow any number of distinct chunks from the same document to compete when they are strongly relevant, subject only to global request budgets.
-3. Allow the validated request profile to keep explicit `rerank_top_n=64`, its per-channel candidate pool of 256, and the existing datastore request count. This change does not alter the configured system default.
-4. Preserve exact-content deduplication, multi-knowledge-base coverage, rerank fallback, stable pagination, and request compatibility.
-5. Keep a warmed representative request below five seconds while returning the previously missing answer chunks.
+1. 对通过字面文档发现或显式 `doc_ids` 确定的文档，至少保留一个包含答案证据的候选片段。
+2. 当同一文档中的多个不同片段都强相关时，允许它们继续竞争候选名额，只受请求级全局预算限制。
+3. 允许验证请求继续显式使用 `rerank_top_n=64`、每通道 256 个候选以及现有数据存储请求数量。本次改动不修改系统配置的默认值。
+4. 保留精确内容去重、多知识库覆盖、重排降级、稳定分页和接口兼容性。
+5. 在返回此前缺失答案片段的同时，将预热后的代表性请求耗时控制在 5 秒以内。
 
-## Non-Goals
+## 非目标
 
-- Guaranteeing every relevant chunk when more candidates exist than the global `rerank_top_n` budget.
-- Adding domain aliases, brand lists, product-size parsing, or other business-specific query rules.
-- Changing document parsing, index mappings, or stored chunk schemas.
-- Adding datastore requests or increasing the default rerank budget.
-- Tuning Elasticsearch, embedding, highlighting, or rerank model performance as part of this change.
+- 当相关候选数量超过全局 `rerank_top_n` 预算时，保证返回每一个相关片段。
+- 添加领域别名、品牌列表、产品规格解析或其他业务专用查询规则。
+- 修改文档解析逻辑、索引映射或已存储片段的数据结构。
+- 增加数据存储请求或提高默认重排预算。
+- 在本次改动中优化 Elasticsearch、Embedding、高亮或重排模型本身的性能。
 
-## Terminology
+## 术语
 
-- **Scoped document**: a document returned by literal document discovery, or explicitly supplied through `doc_ids`.
-- **Scoped answer candidate**: a candidate from the `doc_answer` channel whose source document is scoped and whose content covers at least one current answer term.
-- **Coverage selection**: a bounded first pass that protects one scoped answer candidate per logical report from being crowded out before reranking.
-- **Global fill**: selection of all remaining candidates solely by the existing fused candidate score, without a per-document hard limit.
+- **目标文档**：通过字面文档发现返回的文档，或通过 `doc_ids` 显式指定的文档。
+- **目标文档答案候选**：来自 `doc_answer` 通道、所属文档在目标范围内，并且内容至少覆盖一个当前答案词的候选片段。
+- **覆盖选择**：在重排前执行的有界选择阶段，用于防止每个逻辑报告中最重要的目标文档答案候选被其他候选挤出。
+- **全局填充**：不设置文档级硬上限，仅按照现有候选融合分数选择所有剩余候选。
 
-## Considered Approaches
+## 方案比较
 
-### Increase `rerank_top_n` to 128
+### 将 `rerank_top_n` 提高到 128
 
-This is general and recovers more answer chunks, but it doubles the per-channel pool from 256 to 512 and doubles the rerank batch. The observed latency exceeded seven seconds, so this is useful as a diagnostic upper bound but not the production solution.
+该方案通用且能召回更多答案片段，但会把每通道候选池从 256 提高到 512，并把重排批次扩大一倍。实测耗时超过 7 秒，因此可以用于判断召回上限，但不适合作为生产环境的最终方案。
 
-### Add a fixed score boost to `doc_answer`
+### 给 `doc_answer` 增加固定分数
 
-This is a small change, but it is not deterministic under heavy candidate pressure. A boost that works for one corpus may be too weak or too strong for another, and it still cannot guarantee that a scoped document contributes an answer chunk.
+该方案改动较小，但在候选压力较大时无法提供确定性保证。适用于一个语料库的加分幅度，在另一个语料库中可能过强或过弱，而且仍不能保证目标文档一定贡献答案片段。
 
-### Use bounded scoped-answer coverage followed by unrestricted global fill
+### 有界目标答案覆盖加无限制全局填充
 
-This approach provides a deterministic minimum guarantee, gives unused reserved capacity back to the global pool, permits multiple strong chunks from one document, and adds no expensive operations. This is the selected approach.
+该方案提供确定性的最低覆盖保证，将未使用的预留容量归还全局候选池，允许同一文档中的多个强相关片段进入结果，并且不增加昂贵操作。因此选择该方案。
 
-## Data Flow
+## 数据流
 
 ```text
 full / fallback / document_discovery / doc_answer
                          |
                          v
-              content deduplication
+                    内容去重
                          |
                          v
-                  RRF score fusion
+                    RRF 分数融合
                          |
                          v
-        annotate scoped answer candidates
+               标记目标文档答案候选
                          |
                          v
-   KB coverage + bounded scoped-answer coverage
+          知识库覆盖 + 有界目标答案覆盖
                          |
                          v
-       unrestricted score-based global fill
+               按分数执行无限制全局填充
                          |
                          v
-                 rerank at top 64
+                    重排前 64 条
                          |
                          v
-       threshold + bounded output coverage
+             阈值过滤 + 有界结果覆盖
                          |
                          v
-       unrestricted score-based pagination
+               按分数执行无限制分页
 ```
 
-## Candidate Annotation
+## 候选标记
 
-`Dealer.retrieval()` will pass the discovered or explicitly scoped document IDs into candidate preparation. Candidate preparation will retain the existing channel membership collected during RRF fusion and annotate each prepared candidate with whether it is a scoped answer candidate.
+`Dealer.retrieval()` 将文档发现得到的文档 ID 或显式指定的文档 ID 传入候选准备逻辑。候选准备逻辑继续保留 RRF 融合过程中收集的通道来源，并标记每个准备后的候选是否属于目标文档答案候选。
 
-A candidate is a scoped answer candidate only when all of the following are true:
+只有同时满足以下条件的候选才属于目标文档答案候选：
 
-1. It belongs to a scoped document, including any source represented by an exact-content duplicate.
-2. It appeared in the `doc_answer` channel.
-3. Its normalized display content contains at least one literal answer term from the current query plan.
+1. 候选属于目标文档，包括精确内容重复项所代表的任一来源文档。
+2. 候选曾出现在 `doc_answer` 通道中。
+3. 候选的规范化展示内容至少包含一个当前查询计划中的字面答案词。
 
-Table structure remains a generic ranking bonus, not a requirement. Prose answers remain eligible. No domain term is introduced by the annotation logic.
+表格结构继续作为通用排序加分项，而不是必要条件，因此普通文本答案仍然可以进入。候选标记逻辑不引入任何领域词汇。
 
-Scoped answer candidates are ordered deterministically by:
+目标文档答案候选按照以下顺序进行确定性排序：
 
-1. Answer-term coverage ratio.
-2. Structural evidence bonus.
-3. Existing RRF candidate score.
-4. Stable chunk identifier as a final tie-breaker.
+1. 答案词覆盖比例。
+2. 结构化证据加分。
+3. 现有 RRF 候选分数。
+4. 作为最终稳定排序条件的片段 ID。
 
-## Rerank Candidate Allocation
+## 重排候选分配
 
-The global rerank limit remains unchanged. For `rerank_top_n=64`, selection proceeds as follows:
+全局重排上限保持不变。当 `rerank_top_n=64` 时，按以下步骤选择候选：
 
-1. Create one shared coverage budget for active-knowledge-base and scoped-answer guarantees. Its size is the larger of the active knowledge-base count and half of `rerank_top_n`, capped by `rerank_top_n`. With one active knowledge base and a rerank limit of 64, the shared coverage budget is 32.
-2. Preserve existing active-knowledge-base coverage using the highest-scoring eligible candidates.
-3. Within the remaining shared coverage budget, select at most one best scoped answer candidate per logical report. A candidate satisfying both knowledge-base and scoped-answer coverage consumes only one slot.
-4. Return every unused shared coverage slot to the global pool.
-5. Fill every remaining rerank slot by the existing fused score across all remaining candidates.
-6. Do not apply a per-report or per-document hard cap during global fill.
+1. 为知识库覆盖和目标答案覆盖创建一个共享覆盖预算。其大小取“活跃知识库数量”和 `rerank_top_n` 一半中的较大值，同时不超过 `rerank_top_n`。当只有一个活跃知识库且重排上限为 64 时，共享覆盖预算为 32。
+2. 使用分数最高的合格候选保留现有的活跃知识库覆盖能力。
+3. 在剩余共享覆盖预算内，每个逻辑报告最多选择一个最佳目标文档答案候选。同时满足知识库覆盖和目标答案覆盖的候选只消耗一个名额。
+4. 将未使用的共享覆盖名额全部归还全局候选池。
+5. 在所有剩余候选中，按照现有融合分数填满剩余重排名额。
+6. 全局填充阶段不设置每报告或每文档硬上限。
 
-For the observed request, 15 scoped reports consume 15 protected answer slots and leave 49 slots for unrestricted global competition. If a single document contains eight distinct high-scoring answer chunks, all eight may enter the rerank batch when their scores justify it.
+对于本次观察到的请求，15 份目标报告占用 15 个受保护答案名额，剩余 49 个名额用于不受文档数量限制的全局竞争。如果某一文档包含 8 个不同且高分的答案片段，只要它们的分数足够高，就都可以进入重排批次。
 
-Exact-content duplicates continue to use one rerank slot while preserving all source metadata. The global `rerank_top_n` remains the only hard candidate limit.
+精确内容重复项继续只使用一个重排名额，同时保留所有来源信息。全局 `rerank_top_n` 是唯一的候选数量硬上限。
 
-## Final Ranking And Pagination
+## 最终排序与分页
 
-Rerank scoring and threshold application remain unchanged. Final result ordering changes only in how coverage and document diversity are applied:
+重排评分和阈值应用方式保持不变。最终结果排序只调整覆盖与文档多样化方式：
 
-1. Consider only candidates that passed the existing relevance threshold.
-2. Create a shared first-page coverage budget equal to the larger of the active knowledge-base count and half of `size`, capped by `size`.
-3. Preserve active-knowledge-base coverage, then use the remaining shared coverage budget for the highest-reranked scoped answer candidates, with at most one guaranteed candidate per logical report. A candidate satisfying both guarantees consumes only one slot.
-4. Return unused coverage capacity to the global result pool.
-5. Fill all remaining positions by rerank score without a per-document maximum.
-6. Build one deterministic ordered result list before slicing it by `page` and `size`, so subsequent pages contain the remaining eligible chunks without duplicates.
+1. 只考虑通过现有相关性阈值的候选。
+2. 创建一个共享的首页覆盖预算，其大小取“活跃知识库数量”和 `size` 一半中的较大值，同时不超过 `size`。
+3. 先保留活跃知识库覆盖，再使用剩余共享覆盖预算选择重排分数最高的目标文档答案候选，每个逻辑报告最多保障一个。同时满足两个保障条件的候选只消耗一个名额。
+4. 将未使用的覆盖容量归还全局结果池。
+5. 按照重排分数填满所有剩余位置，不设置每文档最大数量。
+6. 在按照 `page` 和 `size` 截取前，先构建一个确定性的完整结果顺序，确保后续页面包含剩余合格片段且不会重复。
 
-The coverage pass is a minimum guarantee, not a maximum. After coverage, additional chunks from any document compete normally. A document can therefore contribute more than three results when those chunks are strongly relevant.
+覆盖阶段提供的是最低保障，而不是最大限制。完成覆盖后，任何文档中的其他片段都可以正常竞争。因此，当同一文档中的多个片段都强相关时，该文档可以返回超过 3 个结果。
 
-## Degraded Behavior
+## 降级行为
 
-- When document discovery returns no IDs, scoped coverage is disabled and all candidates use global score fill.
-- When explicit `doc_ids` are supplied, those IDs define the document scope without running document discovery.
-- When `doc_answer` fails, `full` and `fallback` continue through the existing channel-isolation behavior.
-- When a scoped document has no candidate with literal answer-term evidence, it does not consume a protected slot.
-- When the number of scoped reports exceeds the coverage budget, reports are ordered by their best scoped answer evidence; remaining candidates can still enter through global fill.
-- When reranking fails, the existing normalized fusion-score fallback is preserved and the same allocation metadata is used.
+- 文档发现没有返回 ID 时，禁用目标覆盖，全部候选使用全局分数填充。
+- 显式传入 `doc_ids` 时，直接使用这些 ID 定义文档范围，不再运行文档发现。
+- `doc_answer` 失败时，`full` 和 `fallback` 按照现有通道隔离行为继续返回结果。
+- 目标文档没有任何包含字面答案词证据的候选时，不强制占用保障名额。
+- 目标报告数量超过覆盖预算时，按照各报告中最佳目标答案证据进行排序；未获保障的候选仍然可以通过全局填充进入结果。
+- 重排失败时，保留现有的规范化融合分数降级逻辑，并继续使用相同的候选分配元数据。
 
-## Observability
+## 可观测性
 
-The structured `High-recall retrieval` record will add:
+结构化的 `High-recall retrieval` 日志增加以下字段：
 
 - `scoped_documents`
 - `scoped_answer_candidates`
@@ -147,46 +147,46 @@ The structured `High-recall retrieval` record will add:
 - `returned_scoped_reports`
 - `candidate_selection_ms`
 
-The log continues to store only the query hash, not the raw question. Existing channel, candidate, rerank, report, knowledge-base, truncation, and total timing fields remain unchanged.
+日志继续只记录查询哈希，不记录原始问题。现有通道、候选、重排、报告、知识库、截断和总耗时字段保持不变。
 
-## Compatibility
+## 兼容性
 
-- No API request or response field is removed or renamed.
-- `rerank_top_n`, `top_k`, `page`, and `size` retain their existing meanings.
-- No new configuration is required.
-- The configured default for `rerank_top_n` is not changed; the performance acceptance profile passes 64 explicitly.
-- Existing callers that omit `rerank_top_n` retain the configured default.
-- The behavior remains bounded by `top_k`, `rerank_top_n`, and page size.
+- 不删除或重命名任何 API 请求和响应字段。
+- `rerank_top_n`、`top_k`、`page` 和 `size` 保持现有含义。
+- 不增加新的必需配置。
+- 不修改系统配置中的 `rerank_top_n` 默认值；性能验收请求显式传入 64。
+- 未传入 `rerank_top_n` 的现有调用方继续使用系统配置的默认值。
+- 整体行为继续受 `top_k`、`rerank_top_n` 和分页大小限制。
 
-## Testing
+## 测试
 
-### Candidate Selection
+### 候选选择
 
-1. Reproduce more candidate reports than rerank slots. Give a scoped report a high-ranked identity chunk and a lower-ranked answer table. Verify that the answer table enters a 64-item rerank set.
-2. Give one scoped report more than three distinct strong answer chunks. Verify that more than three can enter the rerank set and final result when global capacity permits.
-3. Verify that a scoped chunk without any answer-term evidence does not consume a protected slot.
-4. Verify that unused scoped coverage is returned to global fill.
-5. Verify that exact duplicate content still consumes one rerank slot and retains every source.
-6. Verify active knowledge bases remain represented.
+1. 构造候选报告数量大于重排名额的场景。让一份目标报告拥有高排名的规格片段和较低排名的答案表格，验证答案表格能够进入 64 条重排集合。
+2. 为一份目标报告提供超过 3 个不同的强相关答案片段，验证全局容量允许时，超过 3 个片段能够进入重排集合和最终结果。
+3. 验证不包含任何答案词证据的目标片段不会消耗保障名额。
+4. 验证未使用的目标覆盖容量会归还全局填充。
+5. 验证精确重复内容仍然只消耗一个重排名额，并保留所有来源。
+6. 验证所有活跃知识库仍然能够获得覆盖。
 
-### Orchestration And Fallback
+### 检索编排与降级
 
-1. Verify the datastore channel set and request count remain unchanged.
-2. Verify `rerank_top_n=64` still produces a per-channel pool of 256 and sends at most 64 documents to the reranker.
-3. Verify no-discovery, explicit-document, failed-discovery, failed-`doc_answer`, and rerank-failure paths retain useful global results.
-4. Verify the implementation contains no test- or production-time dependency on tire brands, sizes, years, or domain vocabulary.
+1. 验证数据存储通道集合和请求数量保持不变。
+2. 验证 `rerank_top_n=64` 仍然生成每通道 256 条候选，并且最多向重排模型发送 64 个文档。
+3. 验证无文档发现、显式指定文档、文档发现失败、`doc_answer` 失败和重排失败时，仍然能够保留有用的全局结果。
+4. 验证测试代码和生产代码均不依赖轮胎品牌、规格、年份或领域词汇。
 
-### Final Results And Pagination
+### 最终结果与分页
 
-1. Verify knowledge-base and scoped-answer guarantees share one bounded first-page coverage budget.
-2. Verify unused output coverage is returned to global ranking.
-3. Verify one document can return more than three distinct strong chunks.
-4. Verify pagination is stable, contains no duplicate chunk IDs, and exposes remaining globally eligible chunks on later pages.
-5. Verify `total` matches the number of globally pageable eligible chunks.
+1. 验证知识库保障和目标答案保障共享同一个有界首页覆盖预算。
+2. 验证未使用的结果覆盖容量会归还全局排序。
+3. 验证同一文档可以返回超过 3 个不同的强相关片段。
+4. 验证分页顺序稳定、不包含重复片段 ID，并且后续页面能够返回其余全局合格片段。
+5. 验证 `total` 与全局可分页合格片段数量一致。
 
-### Performance Acceptance
+### 性能验收
 
-Run the same representative query at least ten times after warm-up with:
+在完成预热后，使用以下参数对同一个代表性问题至少执行 10 次测试：
 
 ```text
 top_k=1024
@@ -194,17 +194,17 @@ rerank_top_n=64
 size=30
 ```
 
-Acceptance criteria:
+验收条件：
 
-- Both previously observed `53-80` answer tables are returned.
-- No datastore request is added.
-- `selected_candidates` remains at most 64.
-- Candidate selection takes no more than 100 ms.
-- Warmed end-to-end retrieval completes within five seconds in the validation environment.
-- The focused backend test suite and lint checks pass.
+- 此前观察到的两份 `53-80` 答案表格都能够返回。
+- 不增加数据存储请求。
+- `selected_candidates` 不超过 64。
+- 候选选择耗时不超过 100 ms。
+- 在验证环境中，预热后的端到端检索耗时不超过 5 秒。
+- 聚焦的后端测试和代码检查全部通过。
 
-## Rollout And Rollback
+## 发布与回滚
 
-Deploy this as a backend-only incremental change. Compare the new coverage metrics, target answer results, and warmed latency against the existing `rerank_top_n=64` baseline before changing any global defaults.
+本次改动作为纯后端增量发布。修改任何全局默认值前，先将新的覆盖指标、目标答案结果和预热耗时与现有 `rerank_top_n=64` 基线进行比较。
 
-Rollback requires only reverting the candidate-allocation change and restarting the backend. No data, parsing, mapping, or index rollback is needed.
+回滚时只需撤销候选分配改动并重启后端，不需要回滚数据、文档解析结果、索引映射或索引内容。
