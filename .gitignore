@@ -198,3 +198,6 @@ backup
 
 
 .hypothesis
+
+# Local Git worktrees
+ragflow-worktrees/
