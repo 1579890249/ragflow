@@ -23,7 +23,7 @@
 - Create: `test/unit_test/api/db/services/test_file_service_pdf_repair.py`
 - Modify: `api/db/services/file_service.py`
 
-- [ ] **Step 1：编写修复、跳过和失败传播测试**
+- [ ] **Step 1：编写修复、跳过、大小校准和失败传播测试**
 
 ```python
 from types import SimpleNamespace
@@ -92,6 +92,21 @@ def test_repair_pdf_if_needed_does_not_write_unchanged_pdf(monkeypatch):
     assert storage.calls == [("get", "folder-id", "source.pdf")]
 
 
+def test_repair_pdf_if_needed_reconciles_size_after_a_partial_previous_attempt(monkeypatch):
+    file = pdf_file(size=99)
+    storage = RecordingStorage(blob=b"original")
+    updates = []
+    monkeypatch.setattr(file_service_module, "read_potential_broken_pdf", lambda blob: blob)
+    monkeypatch.setattr(FileService, "update_by_id", lambda file_id, values: updates.append((file_id, values)) or 1)
+
+    result = FileService.repair_pdf_if_needed(file, storage_impl=storage)
+
+    assert result is file
+    assert file.size == len(b"original")
+    assert storage.calls == [("get", "folder-id", "source.pdf")]
+    assert updates == [("file-id", {"size": len(b"original")})]
+
+
 def test_repair_pdf_if_needed_skips_non_pdf(monkeypatch):
     file = SimpleNamespace(type=FileType.DOC.value)
     storage = RecordingStorage()
@@ -136,11 +151,13 @@ Expected: FAIL，提示 `FileService` 不存在 `repair_pdf_if_needed`。
 
         blob = storage_impl.get(file.parent_id, file.location)
         repaired_blob = read_potential_broken_pdf(blob)
-        if repaired_blob == blob:
+        if repaired_blob != blob:
+            storage_impl.put(file.parent_id, file.location, repaired_blob)
+
+        repaired_size = len(repaired_blob)
+        if file.size == repaired_size:
             return file
 
-        storage_impl.put(file.parent_id, file.location, repaired_blob)
-        repaired_size = len(repaired_blob)
         if not cls.update_by_id(file.id, {"size": repaired_size}):
             raise RuntimeError("Database error (File size update)!")
         file.size = repaired_size
@@ -155,7 +172,7 @@ Run:
 venv\Scripts\python.exe -m pytest test/unit_test/api/db/services/test_file_service_pdf_repair.py -q
 ```
 
-Expected: 4 passed。
+Expected: 5 passed。
 
 ### Task 2：把修复接入链接流程
 
