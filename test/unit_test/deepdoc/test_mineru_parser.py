@@ -93,3 +93,63 @@ def test_read_output_finds_content_list_under_mineru_nested_auto_directory(tmp_p
     outputs = load_mineru_parser(monkeypatch).MinerUParser()._read_output(output_dir, file_stem, method="auto")
 
     assert outputs == content_list
+
+
+def test_mineru_working_stem_is_utf8_bounded_and_collision_resistant(monkeypatch):
+    module = load_mineru_parser(monkeypatch)
+    shared_prefix = "超长中文文件名" * 30
+
+    first = module._mineru_working_stem(shared_prefix + "甲")
+    second = module._mineru_working_stem(shared_prefix + "乙")
+
+    assert len(first.encode("utf-8")) <= module.MAX_MINERU_WORKING_STEM_BYTES
+    assert len(second.encode("utf-8")) <= module.MAX_MINERU_WORKING_STEM_BYTES
+    assert first != second
+    assert first.rsplit("_", 1)[1].isalnum()
+    assert len(first.rsplit("_", 1)[1]) == 12
+    assert module._mineru_working_stem("short中文") == "short中文"
+
+
+def _stub_mineru_parse(parser, monkeypatch, captured):
+    monkeypatch.setattr(parser, "__images__", lambda *args, **kwargs: None)
+
+    def fake_run(input_path, output_dir, options, callback=None):
+        captured["input_path"] = input_path
+        captured["working_stem"] = input_path.stem
+        assert input_path.is_file()
+        return output_dir
+
+    def fake_read(output_dir, file_stem, method="auto", backend="pipeline"):
+        captured["read_stem"] = file_stem
+        return []
+
+    monkeypatch.setattr(parser, "_run_mineru", fake_run)
+    monkeypatch.setattr(parser, "_read_output", fake_read)
+
+
+def test_parse_pdf_uses_bounded_working_name_for_binary(monkeypatch):
+    module = load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    captured = {}
+    _stub_mineru_parse(parser, monkeypatch, captured)
+
+    parser.parse_pdf(f"{'超长名称' * 30}.pdf", b"%PDF-1.7")
+
+    assert len(captured["working_stem"].encode("utf-8")) <= module.MAX_MINERU_WORKING_STEM_BYTES
+    assert captured["read_stem"] == captured["working_stem"]
+
+
+def test_parse_pdf_copies_renamed_local_input_without_modifying_source(tmp_path, monkeypatch):
+    module = load_mineru_parser(monkeypatch)
+    parser = module.MinerUParser()
+    captured = {}
+    _stub_mineru_parse(parser, monkeypatch, captured)
+    source = tmp_path / f"{'本地超长名称' * 20}.pdf"
+    source.write_bytes(b"%PDF-1.7")
+
+    parser.parse_pdf(str(source), None)
+
+    assert source.read_bytes() == b"%PDF-1.7"
+    assert captured["input_path"] != source
+    assert not captured["input_path"].exists()
+    assert captured["read_stem"] == captured["working_stem"]

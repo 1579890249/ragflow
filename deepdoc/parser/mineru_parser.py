@@ -13,6 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +39,22 @@ from deepdoc.parser.pdf_parser import RAGFlowPdfParser
 LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:
     sys.modules[LOCK_KEY_pdfplumber] = threading.Lock()
+
+MAX_MINERU_WORKING_STEM_BYTES = 180
+MINERU_WORKING_STEM_HASH_LENGTH = 12
+
+
+def _mineru_working_stem(file_stem: str) -> str:
+    normalized = file_stem.replace(" ", "") or "document"
+    encoded = normalized.encode("utf-8")
+    if len(encoded) <= MAX_MINERU_WORKING_STEM_BYTES:
+        return normalized
+
+    digest = hashlib.sha256(encoded).hexdigest()[:MINERU_WORKING_STEM_HASH_LENGTH]
+    suffix = f"_{digest}"
+    prefix_budget = MAX_MINERU_WORKING_STEM_BYTES - len(suffix.encode("ascii"))
+    prefix = encoded[:prefix_budget].decode("utf-8", errors="ignore").rstrip(". ")
+    return f"{prefix or 'document'}{suffix}"
 
 
 class MinerUContentType(StrEnum):
@@ -655,29 +672,37 @@ class MinerUParser(RAGFlowPdfParser):
         enable_formula = parser_cfg.get('mineru_formula_enable', True)
         enable_table = parser_cfg.get('mineru_table_enable', True)
 
-        # remove spaces, or mineru crash, and _read_output fail too
         file_path = Path(filepath)
-        pdf_file_name = file_path.stem.replace(" ", "") + ".pdf"
-        pdf_file_path_valid = os.path.join(file_path.parent, pdf_file_name)
+        working_stem = _mineru_working_stem(file_path.stem)
+        pdf_file_name = f"{working_stem}.pdf"
+        if working_stem != file_path.stem:
+            self.logger.info(
+                "[MinerU] Map original stem to working stem: %s -> %s",
+                file_path.stem,
+                working_stem,
+            )
 
         if binary:
             temp_dir = Path(tempfile.mkdtemp(prefix="mineru_bin_pdf_"))
             temp_pdf = temp_dir / pdf_file_name
-            with open(temp_pdf, "wb") as f:
-                f.write(binary)
+            temp_pdf.write_bytes(binary)
             pdf = temp_pdf
             self.logger.info(f"[MinerU] Received binary PDF -> {temp_pdf}")
             if callback:
                 callback(0.15, f"[MinerU] Received binary PDF -> {temp_pdf}")
         else:
-            if pdf_file_path_valid != filepath:
-                self.logger.info(f"[MinerU] Remove all space in file name: {pdf_file_path_valid}")
-                shutil.move(filepath, pdf_file_path_valid)
-            pdf = Path(pdf_file_path_valid)
-            if not pdf.exists():
+            source_pdf = file_path
+            if not source_pdf.exists():
                 if callback:
-                    callback(-1, f"[MinerU] PDF not found: {pdf}")
-                raise FileNotFoundError(f"[MinerU] PDF not found: {pdf}")
+                    callback(-1, f"[MinerU] PDF not found: {source_pdf}")
+                raise FileNotFoundError(f"[MinerU] PDF not found: {source_pdf}")
+            if source_pdf.name != pdf_file_name:
+                temp_dir = Path(tempfile.mkdtemp(prefix="mineru_input_pdf_"))
+                temp_pdf = temp_dir / pdf_file_name
+                shutil.copy2(source_pdf, temp_pdf)
+                pdf = temp_pdf
+            else:
+                pdf = source_pdf
 
         if output_dir:
             out_dir = Path(output_dir)
