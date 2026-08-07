@@ -26,6 +26,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from io import BytesIO
 from timeit import default_timer as timer
+from types import SimpleNamespace
 
 import numpy as np
 import pdfplumber
@@ -38,6 +39,7 @@ from sklearn.metrics import silhouette_score
 
 from common.file_utils import get_project_base_directory
 from common.misc_utils import pip_install_torch
+from deepdoc.parser.pdf_render_utils import get_pdf_page_slices, get_safe_pdf_zoomin
 from deepdoc.vision import OCR, AscendLayoutRecognizer, LayoutRecognizer, Recognizer, TableStructureRecognizer
 from rag.nlp import rag_tokenizer
 from rag.prompts.generator import vision_llm_describe_prompt
@@ -1040,6 +1042,7 @@ class RAGFlowPdfParser:
             logging.exception("total_page_number")
 
     def __images__(self, fnm, zoomin=3, page_from=0, page_to=299, callback=None):
+        requested_zoomin = zoomin
         self.lefted_chars = []
         self.mean_height = []
         self.mean_width = []
@@ -1053,13 +1056,22 @@ class RAGFlowPdfParser:
             with sys.modules[LOCK_KEY_pdfplumber]:
                 with pdfplumber.open(fnm) if isinstance(fnm, str) else pdfplumber.open(BytesIO(fnm)) as pdf:
                     self.pdf = pdf
-                    self.page_images = [p.to_image(resolution=72 * zoomin, antialias=True).annotated for i, p in enumerate(self.pdf.pages[page_from:page_to])]
+                    pages = self.pdf.pages[page_from:page_to]
+                    effective_zoomin = get_safe_pdf_zoomin(pages, zoomin)
+                    if effective_zoomin < zoomin:
+                        logging.warning(
+                            "PDF render zoom reduced from %.2f to %.2f to limit page image pixels",
+                            zoomin,
+                            effective_zoomin,
+                        )
+                    zoomin = effective_zoomin
+                    self.page_images = [p.to_image(resolution=72 * zoomin, antialias=True).annotated for i, p in enumerate(pages)]
 
                     try:
-                        self.page_chars = [[c for c in page.dedupe_chars().chars if self._has_color(c)] for page in self.pdf.pages[page_from:page_to]]
+                        self.page_chars = [[c for c in page.dedupe_chars().chars if self._has_color(c)] for page in pages]
                     except Exception as e:
                         logging.warning(f"Failed to extract characters for pages {page_from}-{page_to}: {str(e)}")
-                        self.page_chars = [[] for _ in range(page_to - page_from)]  # If failed to extract, using empty list instead.
+                        self.page_chars = [[] for _ in pages]  # If failed to extract, using empty list instead.
 
                     self.total_page = len(self.pdf.pages)
 
@@ -1176,11 +1188,12 @@ class RAGFlowPdfParser:
 
         self.page_cum_height = np.cumsum(self.page_cum_height)
         assert len(self.page_cum_height) == len(self.page_images) + 1
-        if len(self.boxes) == 0 and zoomin < 9:
-            self.__images__(fnm, zoomin * 3, page_from, page_to, callback)
+        if len(self.boxes) == 0 and zoomin == requested_zoomin and zoomin < 9:
+            return self.__images__(fnm, zoomin * 3, page_from, page_to, callback)
+        return zoomin
 
     def __call__(self, fnm, need_image=True, zoomin=3, return_html=False):
-        self.__images__(fnm, zoomin)
+        zoomin = self.__images__(fnm, zoomin)
         self._layouts_rec(zoomin)
         self._table_transformer_job(zoomin)
         self._text_merge()
@@ -1191,7 +1204,7 @@ class RAGFlowPdfParser:
 
     def parse_into_bboxes(self, fnm, callback=None, zoomin=3):
         start = timer()
-        self.__images__(fnm, zoomin, callback=callback)
+        zoomin = self.__images__(fnm, zoomin, callback=callback)
         if callback:
             callback(0.40, "OCR finished ({:.2f}s)".format(timer() - start))
 
@@ -1451,52 +1464,68 @@ class VisionParser(RAGFlowPdfParser):
         self.vision_model = vision_model
         self.outlines = []
 
-    def __images__(self, fnm, zoomin=3, page_from=0, page_to=299, callback=None):
-        try:
-            with sys.modules[LOCK_KEY_pdfplumber]:
-                self.pdf = pdfplumber.open(fnm) if isinstance(fnm, str) else pdfplumber.open(BytesIO(fnm))
-                self.page_images = [p.to_image(resolution=72 * zoomin).annotated for i, p in enumerate(self.pdf.pages[page_from:page_to])]
-                self.total_page = len(self.pdf.pages)
-        except Exception:
-            self.page_images = None
-            self.total_page = 0
-            logging.exception("VisionParser __images__")
+    def _effective_zoomin_for_slices(self, pages, zoomin):
+        if not pages:
+            return zoomin
+
+        virtual_pages = []
+        for page in pages:
+            for _, top, right, bottom in get_pdf_page_slices(page, zoomin):
+                virtual_pages.append(SimpleNamespace(width=right, height=bottom - top))
+
+        effective_zoomin = get_safe_pdf_zoomin(virtual_pages, zoomin)
+        if effective_zoomin < zoomin:
+            logging.warning(
+                "PDF render zoom reduced from %.2f to %.2f to limit page slice pixels",
+                zoomin,
+                effective_zoomin,
+            )
+        return effective_zoomin
 
     def __call__(self, filename, from_page=0, to_page=100000, **kwargs):
         callback = kwargs.get("callback", lambda prog, msg: None)
         zoomin = kwargs.get("zoomin", 3)
-        self.__images__(fnm=filename, zoomin=zoomin, page_from=from_page, page_to=to_page, callback=callback)
-
-        total_pdf_pages = self.total_page
-
-        start_page = max(0, from_page)
-        end_page = min(to_page, total_pdf_pages)
-
         all_docs = []
 
-        for idx, img_binary in enumerate(self.page_images or []):
-            pdf_page_num = idx  # 0-based
-            if pdf_page_num < start_page or pdf_page_num >= end_page:
-                continue
+        try:
+            with pdfplumber.open(filename) if isinstance(filename, str) else pdfplumber.open(BytesIO(filename)) as pdf:
+                self.pdf = pdf
+                self.total_page = len(pdf.pages)
+                start_page = max(0, from_page)
+                end_page = min(to_page, self.total_page)
+                pages = pdf.pages[start_page:end_page]
+                zoomin = self._effective_zoomin_for_slices(pages, zoomin)
+                page_slices = [(page_idx, page, bbox) for page_idx, page in enumerate(pages, start=start_page) for bbox in get_pdf_page_slices(page, zoomin)]
+                total_slices = len(page_slices)
 
-            from rag.app.picture import vision_llm_chunk as picture_vision_llm_chunk
+                for slice_idx, (pdf_page_num, page, bbox) in enumerate(page_slices):
+                    from rag.app.picture import vision_llm_chunk as picture_vision_llm_chunk
 
-            text = picture_vision_llm_chunk(
-                binary=img_binary,
-                vision_model=self.vision_model,
-                prompt=vision_llm_describe_prompt(page=pdf_page_num + 1),
-                callback=callback,
-            )
+                    x0, top, x1, bottom = bbox
+                    with sys.modules[LOCK_KEY_pdfplumber]:
+                        cropped_page = page.crop(bbox) if bottom < float(page.height) or top > 0 else page
+                        img = cropped_page.to_image(resolution=72 * zoomin).annotated
+                    try:
+                        text = picture_vision_llm_chunk(
+                            binary=img,
+                            vision_model=self.vision_model,
+                            prompt=vision_llm_describe_prompt(page=pdf_page_num + 1),
+                            callback=callback,
+                        )
+                    finally:
+                        img.close()
 
-            if kwargs.get("callback"):
-                kwargs["callback"](idx * 1.0 / len(self.page_images), f"Processed: {idx + 1}/{len(self.page_images)}")
+                    if kwargs.get("callback") and total_slices:
+                        kwargs["callback"]((slice_idx + 1) * 1.0 / total_slices, f"Processed: {slice_idx + 1}/{total_slices}")
 
-            if text:
-                width, height = self.page_images[idx].size
-                all_docs.append((
-                    text,
-                    f"@@{pdf_page_num + 1}\t{0.0:.1f}\t{width / zoomin:.1f}\t{0.0:.1f}\t{height / zoomin:.1f}##"
-                ))
+                    if text:
+                        all_docs.append((
+                            text,
+                            f"@@{pdf_page_num + 1}\t{x0:.1f}\t{x1:.1f}\t{top:.1f}\t{bottom:.1f}##"
+                        ))
+        except Exception:
+            self.total_page = 0
+            logging.exception("VisionParser __call__")
         return all_docs, []
 
 

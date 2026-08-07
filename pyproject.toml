@@ -152,6 +152,8 @@ dependencies = [
     "pygithub>=2.8.1",
     "asana>=5.2.2",
     "python-gitlab>=7.0.0",
+    "pptxtoimages==0.1.14",
+    "litellm==1.83.1",
 ]
 
 [dependency-groups]

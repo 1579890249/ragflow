@@ -15,6 +15,7 @@
 #
 
 import copy
+import os
 import re
 from collections import defaultdict
 from io import BytesIO
@@ -31,24 +32,11 @@ from rag.nlp import tokenize, is_english
 
 class Ppt(PptParser):
     def __call__(self, fnm, from_page, to_page, callback=None):
-        txts = super().__call__(fnm, from_page, to_page)
+        input_suffix = os.path.splitext(getattr(self, "source_filename", ""))[1] or None
+        txts = super().__call__(fnm, from_page, to_page, input_suffix=input_suffix)
 
         callback(0.5, "Text extraction finished.")
-        import aspose.slides as slides
-        import aspose.pydrawing as drawing
-        imgs = []
-        with slides.Presentation(BytesIO(fnm)) as presentation:
-            for i, slide in enumerate(presentation.slides[from_page: to_page]):
-                try:
-                    with BytesIO() as buffered:
-                        slide.get_thumbnail(
-                            0.1, 0.1).save(
-                            buffered, drawing.imaging.ImageFormat.jpeg)
-                        buffered.seek(0)
-                        imgs.append(Image.open(buffered).copy())
-                except RuntimeError as e:
-                    raise RuntimeError(
-                        f'ppt parse error at page {i + 1}, original error: {str(e)}') from e
+        imgs = super().ppt_to_pil_images(fnm, from_page, to_page, input_suffix=input_suffix)
         assert len(imgs) == len(
             txts), "Slides text and image do not match: {} vs. {}".format(
             len(imgs), len(txts))
@@ -180,8 +168,9 @@ def chunk(filename, binary=None, from_page=0, to_page=100000,
     }
     doc["title_sm_tks"] = rag_tokenizer.fine_grained_tokenize(doc["title_tks"])
     res = []
-    if re.search(r"\.pptx?$", filename, re.IGNORECASE):
+    if re.search(r"\.(pptx?|dps)$", filename, re.IGNORECASE):
         ppt_parser = Ppt()
+        ppt_parser.source_filename = filename
         for pn, (txt, img) in enumerate(ppt_parser(
                 filename if not binary else binary, from_page, 1000000,
                 callback)):
@@ -243,7 +232,7 @@ def chunk(filename, binary=None, from_page=0, to_page=100000,
         return res
 
     raise NotImplementedError(
-        "file type not supported yet(pptx, pdf supported)")
+        "file type not supported yet(pptx, ppt, dps, pdf supported)")
 
 
 if __name__ == "__main__":

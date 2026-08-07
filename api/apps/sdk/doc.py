@@ -286,7 +286,7 @@ async def update_doc(tenant_id, dataset_id, document_id):
         if req.get("chunk_method") not in valid_chunk_method:
             return get_error_data_result(f"`chunk_method` {req['chunk_method']} doesn't exist")
 
-        if doc.type == FileType.VISUAL or re.search(r"\.(ppt|pptx|pages)$", doc.name):
+        if doc.type == FileType.VISUAL or re.search(r"\.(ppt|pptx|dps|pages)$", doc.name):
             return get_error_data_result(message="Not supported yet!")
 
         if doc.parser_id.lower() != req["chunk_method"].lower():

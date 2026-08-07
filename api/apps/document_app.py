@@ -140,7 +140,7 @@ async def web_crawl():
             doc["parser_id"] = ParserType.PICTURE.value
         if doc["type"] == FileType.AURAL:
             doc["parser_id"] = ParserType.AUDIO.value
-        if re.search(r"\.(ppt|pptx|pages)$", filename):
+        if re.search(r"\.(ppt|pptx|dps|pages)$", filename):
             doc["parser_id"] = ParserType.PRESENTATION.value
         if re.search(r"\.(eml)$", filename):
             doc["parser_id"] = ParserType.EMAIL.value
@@ -769,7 +769,7 @@ async def change_parser():
             else:
                 return get_json_result(data=True)
 
-        if (doc.type == FileType.VISUAL and req["parser_id"] != "picture") or (re.search(r"\.(ppt|pptx|pages)$", doc.name) and req["parser_id"] != "presentation"):
+        if (doc.type == FileType.VISUAL and req["parser_id"] != "picture") or (re.search(r"\.(ppt|pptx|dps|pages)$", doc.name) and req["parser_id"] != "presentation"):
             return get_data_error_result(message="Not supported yet!")
         if "parser_config" in req:
             DocumentService.update_parser_config(doc.id, req["parser_config"])

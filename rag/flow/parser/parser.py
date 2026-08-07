@@ -480,7 +480,7 @@ class Parser(ProcessBase):
                 raise RuntimeError("TCADP parser not available. Please check Tencent Cloud API configuration.")
 
             # Determine file type based on extension
-            if re.search(r"\.pptx?$", name, re.IGNORECASE):
+            if re.search(r"\.(pptx?|dps)$", name, re.IGNORECASE):
                 file_type = "PPTX"
             else:
                 file_type = "PPT"

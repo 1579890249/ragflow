@@ -17,8 +17,12 @@
 import logging
 import re
 import os
+import shutil
+import subprocess
+import tempfile
 from functools import reduce
 from io import BytesIO
+from pathlib import Path
 from timeit import default_timer as timer
 from docx import Document
 from docx.image.exceptions import InvalidImageStreamError, UnexpectedEndOfFileError, UnrecognizedImageError
@@ -180,6 +184,156 @@ PARSERS = {
     "plaintext": by_plaintext,  # default
 }
 
+import zipfile
+import xml.etree.ElementTree as ET
+
+
+OLE_COMPOUND_DOCUMENT_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def is_legacy_ole_document(binary_data: bytes | None) -> bool:
+    return bool(binary_data and binary_data.startswith(OLE_COMPOUND_DOCUMENT_SIGNATURE))
+
+
+def convert_office_document(binary_data: bytes, suffix: str, output_format: str) -> bytes:
+    if not binary_data:
+        raise ValueError("No office document data to convert.")
+
+    if not suffix.startswith("."):
+        suffix = "." + suffix
+
+    temp_dir = tempfile.mkdtemp(prefix="ragflow_office_doc_")
+    try:
+        input_path = Path(temp_dir) / f"input{suffix}"
+        input_path.write_bytes(binary_data)
+
+        user_profile_dir = Path(temp_dir) / "lo_profile"
+        user_profile_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        extra_paths = "/usr/bin:/usr/local/bin:/usr/lib/libreoffice/program"
+        env["PATH"] = f"{extra_paths}:{env.get('PATH', '')}"
+        lo_lib = "/usr/lib/libreoffice/program"
+        existing_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{lo_lib}:{existing_ld}" if existing_ld else lo_lib
+        if not env.get("HOME") or not os.access(env.get("HOME", ""), os.W_OK):
+            env["HOME"] = "/tmp"
+
+        cmd = [
+            "/usr/bin/soffice",
+            f"-env:UserInstallation=file://{user_profile_dir}",
+            "--headless",
+            "--norestore",
+            "--nofirststartwizard",
+            "--convert-to", output_format,
+            str(input_path),
+            "--outdir", temp_dir,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                timeout=120,
+            )
+        except FileNotFoundError:
+            raise RuntimeError("LibreOffice (soffice) not found. Please install LibreOffice to parse .wps files.")
+
+        stderr_text = result.stderr.decode(errors="replace")
+        stdout_text = result.stdout.decode(errors="replace")
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"LibreOffice failed to convert {suffix} to {output_format.upper()} (exit {result.returncode}).\n"
+                f"stderr: {stderr_text}\nstdout: {stdout_text}"
+            )
+
+        expected = input_path.with_suffix(f".{output_format}")
+        if expected.is_file():
+            return expected.read_bytes()
+
+        matches = list(Path(temp_dir).glob(f"*.{output_format}"))
+        if matches:
+            return matches[0].read_bytes()
+        generated = sorted(str(p.name) for p in Path(temp_dir).iterdir())
+        raise FileNotFoundError(
+            f"{output_format.upper()} file not found after conversion: {expected}; "
+            f"generated={generated}; stdout={stdout_text}; stderr={stderr_text}"
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def convert_office_to_docx(binary_data: bytes, suffix: str = ".wps") -> bytes:
+    return convert_office_document(binary_data, suffix, "docx")
+
+
+def convert_office_to_pdf(binary_data: bytes, suffix: str = ".wps") -> bytes:
+    return convert_office_document(binary_data, suffix, "pdf")
+
+
+def parse_office_with_tika(binary_data, filename, callback=None):
+    try:
+        from tika import parser as tika_parser
+    except Exception as e:
+        message = f"tika not available: {e}. Unsupported office parsing."
+        if callback:
+            callback(0.8, message)
+        logging.warning(f"{message} file={filename}")
+        return []
+
+    doc_parsed = tika_parser.from_buffer(BytesIO(binary_data or b""))
+    content = doc_parsed.get("content", None) if doc_parsed else None
+    if content is not None:
+        return [(_, "") for _ in content.split("\n") if _]
+
+    message = f"tika.parser got empty content from {filename}."
+    if callback:
+        callback(0.8, message)
+    logging.warning(message)
+    return []
+
+
+def sanitize_docx_binary(binary_data):
+    """
+    移除 DOCX 中非法的内部锚点超链接（Target=\"#...\"），
+    避免 python-docx 因找不到 'word/#xxx' 而崩溃。
+    不影响图片、表格、文本等正常内容。
+    """
+    try:
+        with zipfile.ZipFile(BytesIO(binary_data), 'r') as zip_in:
+            namelist = zip_in.namelist()
+            file_map = {name: zip_in.read(name) for name in namelist}
+    except Exception:
+        return binary_data  # 非 ZIP 文件，原样返回
+
+    rels_path = 'word/_rels/document.xml.rels'
+    if rels_path not in file_map:
+        return binary_data
+
+    try:
+        content = file_map[rels_path].decode('utf-8')
+        root = ET.fromstring(content)
+        ns = {'r': 'http://schemas.openxmlformats.org/package/2006/relationships'}
+        removed = False
+        for rel in root.findall('r:Relationship', ns):
+            target = rel.get('Target', '')
+            if target.startswith('#'):
+                root.remove(rel)
+                removed = True
+        if removed:
+            new_content = ET.tostring(root, encoding='UTF-8', xml_declaration=True)
+            file_map[rels_path] = new_content
+    except Exception:
+        return binary_data  # 解析失败则跳过
+
+    # 重新打包，保持原始结构
+    output = BytesIO()
+    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zip_out:
+        for name in namelist:
+            zip_out.writestr(name, file_map[name])
+    return output.getvalue()
+
 
 class Docx(DocxParser):
     def __init__(self):
@@ -335,6 +489,8 @@ class Docx(DocxParser):
         return ""
 
     def __call__(self, filename, binary=None, from_page=0, to_page=100000):
+        if binary:
+            binary = sanitize_docx_binary(binary)
         self.doc = Document(
             filename) if not binary else Document(BytesIO(binary))
         pn = 0
@@ -456,7 +612,7 @@ class Pdf(PdfParser):
         start = timer()
         first_start = start
         callback(msg="OCR started")
-        self.__images__(
+        zoomin = self.__images__(
             filename if not binary else binary,
             zoomin,
             from_page,
@@ -682,6 +838,7 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
     res = []
     pdf_parser = None
     section_images = None
+    tika_sections = None
 
     is_root = kwargs.get("is_root", True)
     embed_res = []
@@ -695,6 +852,9 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
 
         # Recursively chunk each embedded file and collect results
         for embed_filename, embed_bytes in embeds:
+            if not re.search(r"\.(pdf|xlsx?|docx?|wps|pptx?|dps|csv|txt|md|markdown|mdx|htm|html|json|jsonl|ldjson|eml|msg)$", embed_filename, re.IGNORECASE):
+                logging.info(f"Skip unsupported embedded file {embed_filename}")
+                continue
             try:
                 sub_res = chunk(embed_filename, binary=embed_bytes, lang=lang, callback=callback, is_root=False,
                                 **kwargs) or []
@@ -706,7 +866,38 @@ def chunk(filename, binary=None, from_page=0, to_page=100000, lang="Chinese", ca
                     callback(0.05, error_msg)
                 continue
 
-    if re.search(r"\.docx$", filename, re.IGNORECASE):
+    if re.search(r"\.docx$", filename, re.IGNORECASE) and is_legacy_ole_document(binary):
+        logging.warning("Legacy DOC content detected with a DOCX filename: %s", filename)
+        filename = re.sub(r"\.docx$", ".doc", filename, flags=re.IGNORECASE)
+
+    if re.search(r"\.wps$", filename, re.IGNORECASE):
+        callback(0.1, "Start to parse.")
+        try:
+            binary = convert_office_to_docx(binary, ".wps")
+            filename = re.sub(r"\.wps$", ".docx", filename, flags=re.IGNORECASE)
+        except Exception as e:
+            logging.warning(f"Failed to convert WPS to DOCX, fallback to PDF: {e}")
+            if callback:
+                callback(0.1, f"WPS to DOCX failed, fallback to PDF: {e}")
+            try:
+                binary = convert_office_to_pdf(binary, ".wps")
+                filename = re.sub(r"\.wps$", ".pdf", filename, flags=re.IGNORECASE)
+            except Exception as pdf_error:
+                logging.warning(f"Failed to convert WPS to PDF, fallback to Tika: {pdf_error}")
+                if callback:
+                    callback(0.1, f"WPS to PDF failed, fallback to Tika: {pdf_error}")
+                tika_sections = parse_office_with_tika(binary, filename, callback)
+                filename = re.sub(r"\.wps$", ".doc", filename, flags=re.IGNORECASE)
+
+    if tika_sections is not None:
+        sections = tika_sections
+        if sections:
+            callback(0.8, "Finish parsing.")
+        else:
+            res.extend(embed_res)
+            return res
+
+    elif re.search(r"\.(docx|wps)$", filename, re.IGNORECASE):
         callback(0.1, "Start to parse.")
         if parser_config.get("analyze_hyperlink", False) and is_root:
             urls = extract_links_from_docx(binary)
