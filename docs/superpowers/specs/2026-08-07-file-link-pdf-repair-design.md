@@ -1,104 +1,90 @@
-# Link-Time PDF Repair Design
+# 文件链接阶段 PDF 修复设计
 
-## Background
+## 背景
 
-PDFs uploaded directly to a knowledge base pass through
-`read_potential_broken_pdf()` before they are stored. PDFs uploaded through
-file management are stored unchanged, and `/file2document/convert` only links
-the existing object to a knowledge base.
+PDF 直接上传知识库时，会在写入存储前经过 `read_potential_broken_pdf()`。
+通过文件管理上传的 PDF 则会原样写入存储，`/file2document/convert` 仅将已有
+对象链接到知识库。
 
-The reproduced `问答测试.pdf` contains malformed object boundaries such as
-`endobj204 0 obj`. Poppler and PyPDF recover its 15 pages, but the
-pdfplumber/pdfminer versions used by RAGFlow report zero pages. Task creation
-then produces an empty task list and `bulk_insert_into_db()` raises an
-`IndexError`.
+已复现的 `问答测试.pdf` 包含 `endobj204 0 obj` 这类格式错误的对象边界。
+Poppler 和 PyPDF 能容错恢复出 15 页，但 RAGFlow 使用的 pdfplumber/pdfminer
+会将其识别为 0 页。任务创建因此得到空任务列表，最终由
+`bulk_insert_into_db()` 抛出 `IndexError`。
 
-## Goals
+## 目标
 
-- Apply the existing PDF repair behavior when a file-management PDF is linked
-  to a knowledge base.
-- Replace the source storage object with repaired bytes so all later links and
-  parses reuse the repaired PDF.
-- Synchronize the file record's size before creating document links.
-- Avoid storage writes for valid PDFs and all non-PDF files.
-- Keep direct knowledge-base upload behavior unchanged.
+- 文件管理中的 PDF 链接到知识库时，复用现有 PDF 修复逻辑。
+- 使用修复后的字节覆盖源存储对象，使后续链接和解析均复用修复结果。
+- 创建知识库文档关联前，同步文件记录中的大小。
+- 有效 PDF 和所有非 PDF 文件不产生额外存储写入。
+- 保持直接上传知识库的现有行为不变。
 
-## Non-Goals
+## 非目标
 
-- Implement a new PDF repair engine.
-- Create a separate repaired copy for each knowledge base.
-- Change parsing, chunking, or page-range semantics.
-- Change the generic bulk-insert helper as part of this fix.
+- 实现新的 PDF 修复引擎。
+- 为每个知识库分别创建修复副本。
+- 修改解析、分块或页码范围语义。
+- 在本次修复中修改通用批量插入工具。
 
-## Approach Comparison
+## 方案比较
 
-### A. Repair the source object when linking
+### 方案 A：链接时修复源对象
 
-Read and repair each PDF once before creating knowledge-base document records.
-If bytes change, overwrite the source object and update its recorded size.
+创建知识库文档记录前，每个 PDF 只读取并修复一次。字节发生变化时，覆盖源
+对象并更新文件大小。
 
-This fixes existing file-management objects and makes future links reuse the
-repaired content. It is the selected approach.
+该方案既能修复文件管理中已有的对象，也能让后续链接复用修复后的内容，故选用
+该方案。
 
-### B. Repair only during file-management upload
+### 方案 B：仅在文件管理上传时修复
 
-This prevents new malformed objects but does not fix files that are already in
-file management. It also does not provide a defensive link-time check.
+该方案可以防止新增异常对象，但不能修复文件管理中已经存在的文件，也无法在
+链接阶段提供防御性检查。
 
-### C. Repair during parsing
+### 方案 C：解析时修复
 
-This repeats repair work on every parse and occurs too late to prevent the
-zero-page task-creation failure.
+该方案会在每次解析时重复执行修复，而且发生时间晚于页数检测，无法避免 0 页
+导致的任务创建失败。
 
-## Design
+## 设计
 
-Add a focused `FileService` operation that accepts a file record and storage
-implementation:
+在 `FileService` 中增加一个职责单一的操作，接收文件记录和存储实现：
 
-1. Return immediately unless the file type is PDF.
-2. Read the object using the file's `parent_id` and `location`.
-3. Pass the bytes to `read_potential_broken_pdf()`.
-4. If the returned bytes are unchanged, return the original file record.
-5. If the bytes changed, overwrite the same storage object.
-6. Update the file row's `size` and the in-memory file record.
-7. Return the file record for document creation.
+1. 文件类型不是 PDF 时立即返回。
+2. 使用文件的 `parent_id` 和 `location` 读取存储对象。
+3. 将字节传给 `read_potential_broken_pdf()`。
+4. 返回字节未变化时，直接返回原文件记录。
+5. 字节发生变化时，覆盖同一个存储对象。
+6. 更新数据库文件记录和内存文件对象中的 `size`。
+7. 返回文件记录，供后续创建知识库文档使用。
 
-`/file2document/convert` invokes this operation once per innermost file before
-removing prior document links and before iterating over target knowledge bases.
-This ordering preserves existing links if repair fails. All newly created
-document rows receive the repaired file size.
+`/file2document/convert` 对每个最内层文件调用一次该操作，调用时间位于删除旧文档
+关联之前，也位于遍历目标知识库之前。该顺序确保修复失败时保留已有链接；新建的
+所有文档记录都使用修复后的文件大小。
 
-## Failure Handling
+## 失败处理
 
-- Storage read, repair, storage write, or database update errors propagate to
-  the route's existing exception handler before existing links are removed or
-  new links are created.
-- Storage is written before the size field is updated because the database
-  must not advertise repaired content that was not stored successfully.
-- If storage succeeds and the size update fails, no new document link is
-  created. A later retry can safely run repair again; the repaired object will
-  then be detected as valid and linking can continue.
-- Existing `read_potential_broken_pdf()` fallback behavior remains unchanged:
-  an unrepairable PDF is returned unchanged.
+- 存储读取、修复、存储写入或数据库更新异常沿用路由现有异常处理，并且发生在
+  删除旧链接或创建新链接之前。
+- 先写存储、后更新文件大小，避免数据库宣称内容已修复但存储写入尚未成功。
+- 如果存储写入成功但大小更新失败，不创建新文档链接。后续重试是安全的：修复后
+  的对象会被识别为有效文件，链接流程可以继续。
+- 保持 `read_potential_broken_pdf()` 当前的兜底行为：无法修复时返回原始 PDF。
 
-## Tests
+## 测试
 
-Add focused unit coverage for the service operation and link integration:
+为服务操作和链接集成增加定向单元测试：
 
-1. A malformed PDF whose repair changes bytes is written back and its file
-   size is updated.
-2. A valid PDF whose repair returns identical bytes causes no storage write or
-   database update.
-3. A non-PDF file causes no storage read or write.
-4. Link conversion uses the repaired size when constructing document rows.
-5. A storage write failure prevents document creation and is surfaced by the
-   existing route error handling.
+1. 异常 PDF 修复后字节发生变化，写回存储并更新文件大小。
+2. 有效 PDF 返回相同字节，不执行存储写入和数据库更新。
+3. 非 PDF 文件不执行存储读写。
+4. 链接转换创建文档时使用修复后的大小。
+5. 存储写入失败时不创建文档，并通过现有路由错误处理返回失败。
 
-## Acceptance Criteria
+## 验收标准
 
-- Linking the reproduced `问答测试.pdf` repairs the source object and allows
-  RAGFlow to discover all 15 pages.
-- The linked document size equals the repaired object size.
-- Linking the valid contract PDF does not rewrite its storage object.
-- Existing file-management and direct knowledge-base upload tests pass.
-- Focused Python tests, Ruff checks, and Python compilation checks pass.
+- 链接已复现的 `问答测试.pdf` 时覆盖源对象，RAGFlow 能识别全部 15 页。
+- 链接后的文档大小等于修复后对象的大小。
+- 链接有效的合同 PDF 时不重写存储对象。
+- 现有文件管理和知识库直接上传测试继续通过。
+- 定向 Python 测试、Ruff 检查和 Python 编译检查通过。
