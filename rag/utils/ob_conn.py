@@ -48,11 +48,13 @@ logger = logging.getLogger('ragflow.ob_conn')
 
 column_order_id = Column("_order_id", Integer, nullable=True, comment="chunk order id for maintaining sequence")
 column_group_id = Column("group_id", String(256), nullable=True, comment="group id for external retrieval")
+column_task_id = Column("task_id", String(256), nullable=True, index=True, comment="task that created this chunk")
 
 column_definitions: list[Column] = [
     Column("id", String(256), primary_key=True, comment="chunk id"),
     Column("kb_id", String(256), nullable=False, index=True, comment="knowledge base id"),
     Column("doc_id", String(256), nullable=True, index=True, comment="document id"),
+    column_task_id,
     Column("docnm_kwd", String(256), nullable=True, comment="document name"),
     Column("doc_type_kwd", String(256), nullable=True, comment="document type"),
     Column("title_tks", String(256), nullable=True, comment="title tokens"),
@@ -103,6 +105,7 @@ vector_column_pattern = re.compile(r"q_(?P<vector_size>\d+)_vec")
 index_columns: list[str] = [
     "kb_id",
     "doc_id",
+    "task_id",
     "available_int",
     "knowledge_graph_kwd",
     "entity_type_kwd",
@@ -538,7 +541,7 @@ class OBConnection(DocStoreConnection):
                 column_name = fts_column.split("^")[0]
                 if not self._index_exists(table_name, fulltext_index_name_template % column_name):
                     return False
-            for column in [column_order_id, column_group_id]:
+            for column in [column_order_id, column_group_id, column_task_id]:
                 if not self._column_exist(table_name, column.name):
                     return False
         except Exception as e:
@@ -563,6 +566,14 @@ class OBConnection(DocStoreConnection):
                 check_func=lambda: self.client.check_table_exists(indexName),
                 process_func=lambda: self._create_table(indexName),
             )
+
+            # Migrate columns before creating indexes that depend on them.
+            for column in [column_order_id, column_group_id, column_task_id]:
+                _try_with_lock(
+                    lock_name=f"ob_add_{column.name}_{indexName}",
+                    check_func=lambda: self._column_exist(indexName, column.name),
+                    process_func=lambda: self._add_column(indexName, column),
+                )
 
             for column_name in index_columns:
                 _try_with_lock(
@@ -590,14 +601,6 @@ class OBConnection(DocStoreConnection):
                 check_func=lambda: self._index_exists(indexName, vector_index_name),
                 process_func=lambda: self._add_vector_index(indexName, vector_field_name),
             )
-
-            # new columns migration
-            for column in [column_order_id, column_group_id]:
-                _try_with_lock(
-                    lock_name=f"ob_add_{column.name}_{indexName}",
-                    check_func=lambda: self._column_exist(indexName, column.name),
-                    process_func=lambda: self._add_column(indexName, column),
-                )
         except Exception as e:
             raise Exception(f"OBConnection.createIndex error: {str(e)}")
         finally:
