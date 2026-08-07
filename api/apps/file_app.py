@@ -408,56 +408,14 @@ async def move():
                     code=RetCode.AUTHENTICATION_ERROR,
                 )
 
-        def _move_entry_recursive(source_file_entry, dest_folder):
-            if source_file_entry.type == FileType.FOLDER.value:
-                existing_folder = FileService.query(name=source_file_entry.name, parent_id=dest_folder.id)
-                if existing_folder:
-                    new_folder = existing_folder[0]
-                else:
-                    new_folder = FileService.insert(
-                        {
-                            "id": get_uuid(),
-                            "parent_id": dest_folder.id,
-                            "tenant_id": source_file_entry.tenant_id,
-                            "created_by": current_user.id,
-                            "name": source_file_entry.name,
-                            "location": "",
-                            "size": 0,
-                            "type": FileType.FOLDER.value,
-                        }
-                    )
-
-                sub_files = FileService.list_all_files_by_parent_id(source_file_entry.id)
-                for sub_file in sub_files:
-                    _move_entry_recursive(sub_file, new_folder)
-
-                FileService.delete_by_id(source_file_entry.id)
-                return
-
-            old_parent_id = source_file_entry.parent_id
-            old_location = source_file_entry.location
-            filename = source_file_entry.name
-
-            new_location = filename
-            while settings.STORAGE_IMPL.obj_exist(dest_folder.id, new_location):
-                new_location += "_"
-
-            try:
-                settings.STORAGE_IMPL.move(old_parent_id, old_location, dest_folder.id, new_location)
-            except Exception as storage_err:
-                raise RuntimeError(f"Move file failed at storage layer: {str(storage_err)}")
-
-            FileService.update_by_id(
-                source_file_entry.id,
-                {
-                    "parent_id": dest_folder.id,
-                    "location": new_location,
-                },
-            )
-
         def _move_sync():
             for file in files:
-                _move_entry_recursive(file, dest_folder)
+                FileService.move_entry_recursive(
+                    file,
+                    dest_folder,
+                    storage_impl=settings.STORAGE_IMPL,
+                    created_by=current_user.id,
+                )
             return get_json_result(data=True)
 
         return await asyncio.to_thread(_move_sync)

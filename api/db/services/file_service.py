@@ -19,6 +19,8 @@ import logging
 import re
 import sys
 import time
+from collections import defaultdict
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Union
@@ -66,6 +68,43 @@ class FileService(CommonService):
         file.size = repaired_size
         return file
 
+    @staticmethod
+    def _calculate_folder_metrics(
+        rows: Iterable[tuple[str, str, int, str]],
+        folder_ids: Iterable[str],
+        *,
+        on_cycle: Callable[[str, str], None] | None = None,
+    ) -> tuple[dict[str, int], dict[str, bool]]:
+        children_by_parent = defaultdict(list)
+        for file_id, parent_id, size, file_type in rows:
+            if file_id != parent_id:
+                children_by_parent[parent_id].append((file_id, size, file_type))
+
+        folder_sizes = {}
+        has_child_folders = {}
+        for folder_id in folder_ids:
+            direct_children = children_by_parent.get(folder_id, ())
+            has_child_folders[folder_id] = any(file_type == FileType.FOLDER.value for _, _, file_type in direct_children)
+
+            size = 0
+            visited = {folder_id}
+            stack = list(direct_children)
+            while stack:
+                file_id, file_size, file_type = stack.pop()
+                if file_id in visited:
+                    if on_cycle:
+                        on_cycle(folder_id, file_id)
+                    continue
+
+                visited.add(file_id)
+                size += file_size
+                if file_type == FileType.FOLDER.value:
+                    stack.extend(children_by_parent.get(file_id, ()))
+
+            folder_sizes[folder_id] = size
+
+        return folder_sizes, has_child_folders
+
     @classmethod
     @DB.connection_context()
     def get_by_pf_id(cls, tenant_id, pf_id, page_number, items_per_page, orderby, desc, keywords):
@@ -93,20 +132,39 @@ class FileService(CommonService):
         files = files.paginate(page_number, items_per_page)
 
         res_files = list(files.dicts())
+        folder_ids = [file["id"] for file in res_files if file["type"] == FileType.FOLDER.value]
+        folder_sizes = {}
+        has_child_folders = {}
+        if folder_ids:
+            started_at = time.perf_counter()
+            tree_rows = (
+                cls.model.select(*[cls.model.id, cls.model.parent_id, cls.model.size, cls.model.type])
+                .where(cls.model.tenant_id == tenant_id)
+                .tuples()
+                .iterator()
+            )
+
+            def log_cycle(root_folder_id, repeated_file_id):
+                logging.warning(
+                    "File tree cycle detected: tenant_id=%s, root_folder_id=%s, repeated_file_id=%s",
+                    tenant_id,
+                    root_folder_id,
+                    repeated_file_id,
+                )
+
+            folder_sizes, has_child_folders = cls._calculate_folder_metrics(tree_rows, folder_ids, on_cycle=log_cycle)
+            logging.debug(
+                "Calculated file folder metrics: tenant_id=%s, folder_count=%d, elapsed=%.3fs",
+                tenant_id,
+                len(folder_ids),
+                time.perf_counter() - started_at,
+            )
+
         for file in res_files:
             if file["type"] == FileType.FOLDER.value:
-                file["size"] = cls.get_folder_size(file["id"])
+                file["size"] = folder_sizes[file["id"]]
                 file["kbs_info"] = []
-                children = list(
-                    cls.model.select()
-                    .where(
-                        (cls.model.tenant_id == tenant_id),
-                        (cls.model.parent_id == file["id"]),
-                        ~(cls.model.id == file["id"]),
-                    )
-                    .dicts()
-                )
-                file["has_child_folder"] = any(value["type"] == FileType.FOLDER.value for value in children)
+                file["has_child_folder"] = has_child_folders[file["id"]]
                 continue
             kbs_info = cls.get_kb_id_by_file_id(file["id"])
             file["kbs_info"] = kbs_info
@@ -449,6 +507,42 @@ class FileService(CommonService):
             raise RuntimeError("Database error (File move)!")
 
     @classmethod
+    def move_entry_recursive(cls, source_file_entry, dest_folder, storage_impl=None, created_by=None):
+        if source_file_entry.type == FileType.FOLDER.value:
+            existing_folder = cls.query(name=source_file_entry.name, parent_id=dest_folder.id)
+            if not existing_folder:
+                cls.update_by_id(source_file_entry.id, {"parent_id": dest_folder.id})
+                return
+
+            new_folder = existing_folder[0]
+            sub_files = cls.list_all_files_by_parent_id(source_file_entry.id)
+            for sub_file in sub_files:
+                cls.move_entry_recursive(sub_file, new_folder, storage_impl=storage_impl, created_by=created_by)
+
+            cls.delete_by_id(source_file_entry.id)
+            return
+
+        if storage_impl is None:
+            storage_impl = settings.STORAGE_IMPL
+
+        old_parent_id = source_file_entry.parent_id
+        old_location = source_file_entry.location
+        new_location = source_file_entry.name
+        while storage_impl.obj_exist(dest_folder.id, new_location):
+            new_location += "_"
+
+        if not storage_impl.move(old_parent_id, old_location, dest_folder.id, new_location):
+            raise RuntimeError("Move file failed at storage layer")
+
+        cls.update_by_id(
+            source_file_entry.id,
+            {
+                "parent_id": dest_folder.id,
+                "location": new_location,
+            },
+        )
+
+    @classmethod
     @DB.connection_context()
     def upload_document(self, kb, file_objs, user_id, src="local", parent_path: str | None = None):
         root_folder = self.get_root_folder(user_id)
@@ -555,7 +649,7 @@ class FileService(CommonService):
             return ParserType.PICTURE.value
         if doc_type == FileType.AURAL:
             return ParserType.AUDIO.value
-        if re.search(r"\.(ppt|pptx|pages)$", filename):
+        if re.search(r"\.(ppt|pptx|dps|pages)$", filename):
             return ParserType.PRESENTATION.value
         if re.search(r"\.(msg|eml)$", filename):
             return ParserType.EMAIL.value

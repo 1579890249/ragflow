@@ -549,8 +549,8 @@ DB.lock = DatabaseLock[settings.DATABASE_TYPE.upper()].value
 
 def close_connection():
     try:
-        if DB:
-            DB.close_stale(age=30)
+        if DB and not DB.is_closed():
+            DB.close()
     except Exception as e:
         logging.exception(e)
 
