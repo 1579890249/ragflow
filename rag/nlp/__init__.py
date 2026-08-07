@@ -18,7 +18,7 @@ import logging
 import random
 from collections import Counter, defaultdict
 
-from common.token_utils import num_tokens_from_string
+from common.token_utils import encoder, num_tokens_from_string
 import re
 import copy
 import roman_numbers as r
@@ -993,6 +993,50 @@ def hierarchical_merge(bull, sections, depth):
     return res
 
 
+def _split_text_by_token_window(text, chunk_token_num):
+    if chunk_token_num <= 0 or num_tokens_from_string(text) <= chunk_token_num:
+        return [text]
+    try:
+        tokens = encoder.encode(text)
+        return [encoder.decode(tokens[i: i + chunk_token_num]) for i in range(0, len(tokens), chunk_token_num)]
+    except Exception:
+        size = max(1, len(text) // max(1, num_tokens_from_string(text) // chunk_token_num + 1))
+        return [text[i: i + size] for i in range(0, len(text), size)]
+
+
+def _split_oversized_section(sec, pos, chunk_token_num, delimiter):
+    if chunk_token_num <= 0 or num_tokens_from_string(sec) <= chunk_token_num:
+        return [(sec, pos)]
+
+    dels = [re.escape(d) for d in get_delimiters(delimiter) if d]
+    if not dels:
+        return [(part, pos) for part in _split_text_by_token_window(sec, chunk_token_num) if part]
+
+    delimiter_pattern = "|".join(dels)
+    pieces = []
+    text_buf = ""
+    for part in re.split(r"(%s)" % delimiter_pattern, sec, flags=re.DOTALL):
+        if not part:
+            continue
+        if re.fullmatch(delimiter_pattern, part):
+            if text_buf:
+                pieces.append(text_buf + part)
+                text_buf = ""
+            continue
+        if text_buf:
+            pieces.append(text_buf)
+        text_buf = part
+    if text_buf:
+        pieces.append(text_buf)
+
+    split_sections = []
+    for piece in pieces:
+        split_sections.extend((part, pos) for part in _split_text_by_token_window(piece, chunk_token_num) if part)
+    if pos and len(split_sections) > 1:
+        split_sections = [(part + pos, "") for part, _ in split_sections]
+    return split_sections or [(sec, pos)]
+
+
 def naive_merge(sections: str | list, chunk_token_num=128, delimiter="\n。；！？", overlapped_percent=0):
     from deepdoc.parser.pdf_parser import RAGFlowPdfParser
     if not sections:
@@ -1047,7 +1091,8 @@ def naive_merge(sections: str | list, chunk_token_num=128, delimiter="\n。；�
         return cks
 
     for sec, pos in sections:
-        add_chunk("\n" + sec, pos)
+        for split_sec, split_pos in _split_oversized_section(sec, pos, chunk_token_num, delimiter):
+            add_chunk("\n" + split_sec, split_pos)
 
     return cks
 

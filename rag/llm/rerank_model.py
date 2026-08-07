@@ -188,10 +188,13 @@ class OpenAI_APIRerank(Base):
     _FACTORY_NAME = "OpenAI-API-Compatible"
 
     def __init__(self, key, model_name, base_url):
-        if base_url.find("/rerank") == -1:
-            self.base_url = urljoin(base_url, "/rerank")
-        else:
+        if not base_url:
+            raise ValueError("url cannot be None")
+        base_url = base_url.rstrip("/")
+        if URL(base_url).path.rstrip("/").endswith("/rerank"):
             self.base_url = base_url
+        else:
+            self.base_url = str(URL(base_url) / "rerank")
         self.headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
         self.model_name = model_name.split("___")[0]
 
@@ -428,7 +431,14 @@ class GPUStackRerank(Base):
             raise ValueError("url cannot be None")
 
         self.model_name = model_name
-        self.base_url = str(URL(base_url) / "v1" / "rerank")
+        base_url = base_url.rstrip("/")
+        path = URL(base_url).path.rstrip("/")
+        if path.endswith("/v1/rerank"):
+            self.base_url = base_url
+        elif path.endswith("/v1"):
+            self.base_url = str(URL(base_url) / "rerank")
+        else:
+            self.base_url = str(URL(base_url) / "v1" / "rerank")
         self.headers = {
             "accept": "application/json",
             "content-type": "application/json",
