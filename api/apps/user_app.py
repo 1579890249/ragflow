@@ -100,7 +100,7 @@ async def login():
     email = json_body.get("email", "")
     if email == "admin@ragflow.io":
         return get_json_result(data=False, code=RetCode.AUTHENTICATION_ERROR, message="Default admin account cannot be used to login normal services!")
-    
+
     users = UserService.query(email=email)
     if not users:
         return get_json_result(
@@ -125,7 +125,7 @@ async def login():
         )
     elif user:
         response_data = user.to_json()
-        user.access_token = get_uuid()
+    #    user.access_token = get_uuid()
         login_user(user)
         user.update_time = current_timestamp()
         user.update_date = datetime_format(datetime.now())
@@ -258,7 +258,7 @@ async def oauth_callback(channel):
 
         # User exists, try to log in
         user = users[0]
-        user.access_token = get_uuid()
+        #user.access_token = get_uuid()
         if user and hasattr(user, 'is_active') and user.is_active == "0":
             return redirect("/?error=user_inactive")
 
@@ -350,7 +350,7 @@ async def github_callback():
 
     # User has already registered, try to log in
     user = users[0]
-    user.access_token = get_uuid()
+    #user.access_token = get_uuid()
     if user and hasattr(user, 'is_active') and user.is_active == "0":
         return redirect("/?error=user_inactive")
     login_user(user)
@@ -456,7 +456,7 @@ async def feishu_callback():
     user = users[0]
     if user and hasattr(user, 'is_active') and user.is_active == "0":
         return redirect("/?error=user_inactive")
-    user.access_token = get_uuid()
+    #user.access_token = get_uuid()
     login_user(user)
     user.save()
     return redirect("/?auth=%s" % user.get_id())
