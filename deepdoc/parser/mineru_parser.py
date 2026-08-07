@@ -454,11 +454,16 @@ class MinerUParser(RAGFlowPdfParser):
             poss.append(([int(p) - 1 for p in pn.split("-")], left, right, top, bottom))
         return poss
 
-    def _read_output(self, output_dir: Path, file_stem: str, method: str = "auto", backend: str = "pipeline") -> list[
-        dict[str, Any]]:
-        json_file = None
-        subdir = None
-        attempted = []
+    def _read_output(
+            self,
+            output_dir: Path,
+            file_stem: str,
+            method: str = "auto",
+            backend: str = "pipeline",
+    ) -> list[dict[str, Any]]:
+        json_file: Path | None = None
+        subdir: Path | None = None
+        attempted: list[Path] = []
 
         # mirror MinerU's sanitize_filename to align ZIP naming
         def _sanitize_filename(name: str) -> str:
@@ -469,41 +474,126 @@ class MinerUParser(RAGFlowPdfParser):
             return sanitized or "unnamed"
 
         safe_stem = _sanitize_filename(file_stem)
-        allowed_names = {f"{file_stem}_content_list.json", f"{safe_stem}_content_list.json"}
+
+        original_name = f"{file_stem}_content_list.json"
+        safe_name = f"{safe_stem}_content_list.json"
+        allowed_names = {original_name, safe_name}
+
         self.logger.info(f"[MinerU] Expected output files: {', '.join(sorted(allowed_names))}")
         self.logger.info(f"[MinerU] Searching output in: {output_dir}")
+        self.logger.info(f"[MinerU] method={method}, backend={backend}, file_stem={file_stem}, safe_stem={safe_stem}")
 
-        jf = output_dir / f"{file_stem}_content_list.json"
-        self.logger.info(f"[MinerU] Trying original path: {jf}")
-        attempted.append(jf)
-        if jf.exists():
-            subdir = output_dir
-            json_file = jf
-        else:
-            alt = output_dir / f"{safe_stem}_content_list.json"
-            self.logger.info(f"[MinerU] Trying sanitized filename: {alt}")
-            attempted.append(alt)
-            if alt.exists():
-                subdir = output_dir
-                json_file = alt
-            else:
-                nested_alt = output_dir / safe_stem / f"{safe_stem}_content_list.json"
-                self.logger.info(f"[MinerU] Trying sanitized nested path: {nested_alt}")
-                attempted.append(nested_alt)
-                if nested_alt.exists():
-                    subdir = nested_alt.parent
-                    json_file = nested_alt
+        candidate_dirs: list[Path] = []
+        seen_dirs: set[Path] = set()
 
+        def _add_dir(p: Path | None):
+            if not p:
+                return
+            p = Path(p)
+            if p not in seen_dirs:
+                candidate_dirs.append(p)
+                seen_dirs.add(p)
+
+        # 1. 最常见：直接输出在根目录
+        _add_dir(output_dir)
+
+        # 2. 原始/安全文件名作为嵌套目录
+        _add_dir(output_dir / file_stem)
+        if safe_stem != file_stem:
+            _add_dir(output_dir / safe_stem)
+
+        # 3. method / backend 相关目录
+        #    method=auto 时很关键；backend 有时会参与目录结构
+        if method:
+            _add_dir(output_dir / method)
+            _add_dir(output_dir / method / file_stem)
+            _add_dir(output_dir / file_stem / method)
+            if safe_stem != file_stem:
+                _add_dir(output_dir / method / safe_stem)
+                _add_dir(output_dir / safe_stem / method)
+
+        if backend:
+            _add_dir(output_dir / backend)
+            _add_dir(output_dir / backend / file_stem)
+            if safe_stem != file_stem:
+                _add_dir(output_dir / backend / safe_stem)
+
+        # 4. MinerU 常见固定目录补充
+        for sub in ("auto", "vlm", "ocr", "txt"):
+            _add_dir(output_dir / sub)
+            _add_dir(output_dir / sub / file_stem)
+            if safe_stem != file_stem:
+                _add_dir(output_dir / sub / safe_stem)
+
+        # 5. 组装候选文件
+        candidate_files: list[Path] = []
+        seen_files: set[Path] = set()
+
+        def _add_file(p: Path):
+            if p not in seen_files:
+                candidate_files.append(p)
+                seen_files.add(p)
+
+        # 优先顺序：
+        # - 先查每个目录下的原始文件名
+        # - 再查安全文件名
+        for d in candidate_dirs:
+            _add_file(d / original_name)
+            if safe_name != original_name:
+                _add_file(d / safe_name)
+
+        # 6. 逐个尝试
+        for candidate in candidate_files:
+            self.logger.info(f"[MinerU] Trying path: {candidate}")
+            attempted.append(candidate)
+            if candidate.exists():
+                json_file = candidate
+                subdir = candidate.parent
+                self.logger.info(f"[MinerU] Found output file: {json_file}")
+                break
+
+        # 7. 兜底：递归搜索
+        #    避免特殊版本 MinerU 输出结构变化导致漏判
         if not json_file:
-            raise FileNotFoundError(f"[MinerU] Missing output file, tried: {', '.join(str(p) for p in attempted)}")
+            self.logger.warning("[MinerU] Direct path matching failed, fallback to recursive search")
+            possible_names = {original_name, safe_name}
+            try:
+                recursive_candidates = sorted(output_dir.rglob("*_content_list.json"))
+                attempted.extend(recursive_candidates)
+                for p in recursive_candidates:
+                    if p.name in possible_names:
+                        json_file = p
+                        subdir = p.parent
+                        self.logger.info(f"[MinerU] Found output file by recursive search: {json_file}")
+                        break
+                if not json_file and recursive_candidates:
+                    json_file = recursive_candidates[0]
+                    subdir = json_file.parent
+                    self.logger.info(f"[MinerU] Found fallback output file by recursive search: {json_file}")
+            except Exception as e:
+                self.logger.warning(f"[MinerU] Recursive search failed: {e}")
+
+        if not json_file or not subdir:
+            raise FileNotFoundError(
+                "[MinerU] Missing output file, tried:\n" + "\n".join(str(p) for p in attempted)
+            )
 
         with open(json_file, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        # 8. 修正图片类相对路径
         for item in data:
             for key in ("img_path", "table_img_path", "equation_img_path"):
                 if key in item and item[key]:
-                    item[key] = str((subdir / item[key]).resolve())
+                    try:
+                        img_path = Path(item[key])
+                        if not img_path.is_absolute():
+                            item[key] = str((subdir / img_path).resolve())
+                        else:
+                            item[key] = str(img_path.resolve())
+                    except Exception as e:
+                        self.logger.warning(f"[MinerU] Failed to resolve {key}={item[key]}: {e}")
+
         return data
 
     def _transfer_to_sections(self, outputs: list[dict[str, Any]], parse_method: str = None):
