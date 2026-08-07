@@ -45,6 +45,28 @@ class FileService(CommonService):
     model = File
 
     @classmethod
+    def repair_pdf_if_needed(cls, file, storage_impl=None):
+        if file.type != FileType.PDF.value:
+            return file
+
+        if storage_impl is None:
+            storage_impl = settings.STORAGE_IMPL
+
+        blob = storage_impl.get(file.parent_id, file.location)
+        repaired_blob = read_potential_broken_pdf(blob)
+        if repaired_blob != blob:
+            storage_impl.put(file.parent_id, file.location, repaired_blob)
+
+        repaired_size = len(repaired_blob)
+        if file.size == repaired_size:
+            return file
+
+        if not cls.update_by_id(file.id, {"size": repaired_size}):
+            raise RuntimeError("Database error (File size update)!")
+        file.size = repaired_size
+        return file
+
+    @classmethod
     @DB.connection_context()
     def get_by_pf_id(cls, tenant_id, pf_id, page_number, items_per_page, orderby, desc, keywords):
         # Get files by parent folder ID with pagination and filtering

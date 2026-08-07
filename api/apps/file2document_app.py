@@ -48,6 +48,12 @@ async def convert():
             if file.type == FileType.FOLDER.value:
                 file_ids_list = FileService.get_all_innermost_file_ids(file_id, [])
             for id in file_ids_list:
+                e, file = FileService.get_by_id(id)
+                if not e:
+                    return get_data_error_result(
+                        message="Can't find this file!")
+                file = FileService.repair_pdf_if_needed(file)
+
                 informs = File2DocumentService.get_by_file_id(id)
                 # delete
                 for inform in informs:
@@ -69,10 +75,6 @@ async def convert():
                     if not e:
                         return get_data_error_result(
                             message="Can't find this dataset!")
-                    e, file = FileService.get_by_id(id)
-                    if not e:
-                        return get_data_error_result(
-                            message="Can't find this file!")
 
                     doc = DocumentService.insert({
                         "id": get_uuid(),
