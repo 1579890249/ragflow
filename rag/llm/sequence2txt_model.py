@@ -254,14 +254,43 @@ class TencentCloudSeq2txt(Base):
 class GPUStackSeq2txt(Base):
     _FACTORY_NAME = "GPUStack"
 
-    def __init__(self, key, model_name, base_url):
+    def __init__(self, key, model_name, **kwargs):
+        base_url = kwargs.get("base_url")
         if not base_url:
             raise ValueError("url cannot be None")
-        if base_url.split("/")[-1] != "v1":
-            base_url = os.path.join(base_url, "v1")
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
+        if not self.base_url.endswith("/v1"):
+            self.base_url = f"{self.base_url}/v1"
         self.model_name = model_name
         self.key = key
+
+    def transcription(self, audio, prompt=None, response_format="json", temperature=0.7):
+        if isinstance(audio, str):
+            with open(audio, "rb") as audio_file:
+                audio_data = audio_file.read()
+            audio_file_name = os.path.basename(audio)
+        else:
+            audio_data = audio
+            audio_file_name = "audio.wav"
+
+        payload = {"model": self.model_name, "prompt": prompt, "response_format": response_format, "temperature": temperature}
+
+        files = {"file": (audio_file_name, audio_data)}
+        headers = {"Authorization": "Bearer " + self.key}
+
+        try:
+            response = requests.post(f"{self.base_url}/audio/transcriptions", files=files, data=payload, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+
+            if "text" in result:
+                transcription_text = result["text"].strip()
+                return transcription_text, num_tokens_from_string(transcription_text)
+            else:
+                return "**ERROR**: Failed to retrieve transcription.", 0
+
+        except requests.exceptions.RequestException as e:
+            return f"**ERROR**: {str(e)}", 0
 
 
 class GiteeSeq2txt(Base):
