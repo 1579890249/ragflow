@@ -918,7 +918,8 @@ async def stop_parsing(tenant_id, dataset_id):
             return get_error_data_result("Can't stop parsing document with progress at 0 or 1")
         # Send cancellation signal via Redis to stop background task
         cancel_all_task_of(id)
-        info = {"run": "2", "progress": 0, "chunk_num": 0}
+        DocumentService.clear_chunk_num_when_rerun(id)
+        info = {"run": "2", "progress": 0, "chunk_num": 0, "token_num": 0}
         DocumentService.update_by_id(id, info)
         settings.docStoreConn.delete({"doc_id": doc[0].id}, search.index_name(tenant_id), dataset_id)
         success_count += 1

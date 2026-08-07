@@ -37,6 +37,7 @@ from rag.nlp import search
 
 CANVAS_DEBUG_DOC_ID = "dataflow_x"
 GRAPH_RAPTOR_FAKE_DOC_ID = "graph_raptor_x"
+TASK_CANCELLATION_TTL_SECONDS = int(os.environ.get("TASK_CANCELLATION_TTL_SECONDS", "14400"))
 
 def trim_header_by_lines(text: str, max_length) -> str:
     # Trim header text to maximum length while preserving line breaks
@@ -487,9 +488,17 @@ def reuse_prev_task_chunks(task: dict, prev_tasks: list[dict], chunking_config: 
 def cancel_all_task_of(doc_id):
     for t in TaskService.query(doc_id=doc_id):
         try:
-            REDIS_CONN.set(f"{t.id}-cancel", "x")
+            REDIS_CONN.set(f"{t.id}-cancel", "x", TASK_CANCELLATION_TTL_SECONDS)
+            logging.info(f"Marked task {t.id} as canceled for document {doc_id}")
         except Exception as e:
             logging.exception(e)
+
+
+def clear_canceled(task_id):
+    try:
+        REDIS_CONN.delete(f"{task_id}-cancel")
+    except Exception as e:
+        logging.exception(f"Failed to clear cancellation marker for task {task_id}: {e}")
 
 
 def has_canceled(task_id):

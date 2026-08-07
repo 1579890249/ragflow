@@ -599,6 +599,9 @@ async def run():
                 if str(req["run"]) == TaskStatus.CANCEL.value:
                     if str(doc.run) == TaskStatus.RUNNING.value:
                         cancel_all_task_of(id)
+                        DocumentService.clear_chunk_num_when_rerun(id)
+                        info["chunk_num"] = 0
+                        info["token_num"] = 0
                     else:
                         return get_data_error_result(message="Cannot cancel a task that is not in RUNNING status")
                 if all([("delete" not in req or req["delete"]), str(req["run"]) == TaskStatus.RUNNING.value, str(doc.run) == TaskStatus.DONE.value]):

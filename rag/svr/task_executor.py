@@ -55,7 +55,13 @@ from peewee import DoesNotExist
 from common.constants import LLMType, ParserType, PipelineTaskType
 from api.db.services.document_service import DocumentService
 from api.db.services.llm_service import LLMBundle
-from api.db.services.task_service import TaskService, has_canceled, CANVAS_DEBUG_DOC_ID, GRAPH_RAPTOR_FAKE_DOC_ID
+from api.db.services.task_service import (
+    CANVAS_DEBUG_DOC_ID,
+    GRAPH_RAPTOR_FAKE_DOC_ID,
+    TaskService,
+    clear_canceled,
+    has_canceled,
+)
 from api.db.services.file2document_service import File2DocumentService
 from common.versions import get_ragflow_version
 from api.db.db_models import close_connection
@@ -132,6 +138,7 @@ def signal_handler(sig, frame):
 
 
 def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing..."):
+    cancel = False
     try:
         if prog is not None and prog < 0:
             msg = "[ERROR]" + msg
@@ -152,15 +159,33 @@ def set_progress(task_id, from_page=0, to_page=-1, prog=None, msg="Processing...
             d["progress"] = prog
 
         TaskService.update_progress(task_id, d)
-
-        close_connection()
-        if cancel:
-            raise TaskCanceledException(msg)
-        logging.info(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}")
     except DoesNotExist:
-        logging.warning(f"set_progress({task_id}) got exception DoesNotExist")
+        logging.info(f"set_progress({task_id}) stopped because the task no longer exists")
+        raise TaskCanceledException(f"Task {task_id} no longer exists")
     except Exception as e:
         logging.exception(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}, got exception: {e}")
+    finally:
+        close_connection()
+
+    if cancel:
+        raise TaskCanceledException(msg)
+    logging.info(f"set_progress({task_id}), progress: {prog}, progress_msg: {msg}")
+
+
+async def cleanup_task_chunks(task_id, tenant_id, dataset_id):
+    index_name = search.index_name(tenant_id)
+    exists = await asyncio.to_thread(settings.docStoreConn.index_exist, index_name, dataset_id)
+    if not exists:
+        return 0
+
+    deleted = await asyncio.to_thread(
+        settings.docStoreConn.delete,
+        {"task_id": task_id},
+        index_name,
+        dataset_id,
+    )
+    logging.info(f"Removed {deleted} chunk(s) for canceled task {task_id}")
+    return deleted
 
 
 async def collect():
@@ -207,10 +232,16 @@ async def collect():
 
     if task:
         canceled = has_canceled(task["id"])
+    else:
+        canceled = has_canceled(msg["id"])
     if not task or canceled:
         state = "is unknown" if not task else "has been cancelled"
-        FAILED_TASKS += 1
-        logging.warning(f"collect task {msg['id']} {state}")
+        if canceled:
+            logging.info(f"collect task {msg['id']} {state}")
+            clear_canceled(msg["id"])
+        else:
+            FAILED_TASKS += 1
+            logging.warning(f"collect task {msg['id']} {state}")
         redis_msg.ack()
         return None, None
 
@@ -819,6 +850,7 @@ async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_c
     mothers = []
     mother_ids = set([])
     for ck in chunks:
+        ck["task_id"] = task_id
         mom = ck.get("mom") or ck.get("mom_with_weight") or ""
         if not mom:
             continue
@@ -834,7 +866,7 @@ async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_c
         flds = list(mom_ck.keys())
         for fld in flds:
             if fld not in ["id", "content_with_weight", "doc_id", "docnm_kwd", "kb_id", "available_int",
-                           "position_int"]:
+                           "position_int", "task_id"]:
                 del mom_ck[fld]
         mothers.append(mom_ck)
 
@@ -843,6 +875,7 @@ async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_c
                                 search.index_name(task_tenant_id), task_dataset_id, )
         task_canceled = has_canceled(task_id)
         if task_canceled:
+            await cleanup_task_chunks(task_id, task_tenant_id, task_dataset_id)
             progress_callback(-1, msg="Task has been canceled.")
             return False
 
@@ -851,6 +884,7 @@ async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_c
                                                    search.index_name(task_tenant_id), task_dataset_id, )
         task_canceled = has_canceled(task_id)
         if task_canceled:
+            await cleanup_task_chunks(task_id, task_tenant_id, task_dataset_id)
             progress_callback(-1, msg="Task has been canceled.")
             return False
         if b % 128 == 0:
@@ -865,8 +899,7 @@ async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_c
             TaskService.update_chunk_ids(task_id, chunk_ids_str)
         except DoesNotExist:
             logging.warning(f"do_handle_task update_chunk_ids failed since task {task_id} is unknown.")
-            doc_store_result = await asyncio.to_thread(settings.docStoreConn.delete, {"id": chunk_ids},
-                                                       search.index_name(task_tenant_id), task_dataset_id, )
+            await cleanup_task_chunks(task_id, task_tenant_id, task_dataset_id)
             tasks = []
             for chunk_id in chunk_ids:
                 tasks.append(asyncio.create_task(delete_image(task_dataset_id, chunk_id)))
@@ -1076,10 +1109,12 @@ async def do_handle_task(task):
 
     async def _maybe_insert_es(_chunks):
         if has_canceled(task_id):
-            return True
+            progress_callback(-1, msg="Task has been canceled.")
+            return False
         insert_result = await insert_es(task_id, task_tenant_id, task_dataset_id, _chunks, progress_callback)
         return bool(insert_result)
 
+    needs_cleanup = False
     try:
         if not await _maybe_insert_es(chunks):
             return
@@ -1090,6 +1125,9 @@ async def do_handle_task(task):
             )
         )
 
+        if has_canceled(task_id):
+            progress_callback(-1, msg="Task has been canceled.")
+            return
         DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, token_count, chunk_count, 0)
 
         progress_callback(msg="Indexing done ({:.2f}s).".format(timer() - start_ts))
@@ -1098,6 +1136,9 @@ async def do_handle_task(task):
             d = toc_thread.result()
             if d:
                 if not await _maybe_insert_es([d]):
+                    return
+                if has_canceled(task_id):
+                    progress_callback(-1, msg="Task has been canceled.")
                     return
                 DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, 0, 1, 0)
 
@@ -1113,21 +1154,13 @@ async def do_handle_task(task):
             )
         )
 
+    except TaskCanceledException:
+        needs_cleanup = True
+        raise
     finally:
-        if has_canceled(task_id):
+        if needs_cleanup or has_canceled(task_id):
             try:
-                exists = await asyncio.to_thread(
-                    settings.docStoreConn.indexExist,
-                    search.index_name(task_tenant_id),
-                    task_dataset_id,
-                )
-                if exists:
-                    await asyncio.to_thread(
-                        settings.docStoreConn.delete,
-                        {"doc_id": task_doc_id},
-                        search.index_name(task_tenant_id),
-                        task_dataset_id,
-                    )
+                await cleanup_task_chunks(task_id, task_tenant_id, task_dataset_id)
             except Exception as e:
                 logging.exception(
                     f"Remove doc({task_doc_id}) from docStore failed when task({task_id}) canceled, exception: {e}")
@@ -1151,6 +1184,9 @@ async def handle_task():
         DONE_TASKS += 1
         CURRENT_TASKS.pop(task_id, None)
         logging.info(f"handle_task done for task {json.dumps(task)}")
+    except TaskCanceledException as e:
+        CURRENT_TASKS.pop(task_id, None)
+        logging.info(f"handle_task canceled for task {task_id}: {getattr(e, 'msg', str(e))}")
     except Exception as e:
         FAILED_TASKS += 1
         CURRENT_TASKS.pop(task_id, None)
@@ -1172,6 +1208,8 @@ async def handle_task():
             PipelineOperationLogService.record_pipeline_operation(document_id=task["doc_id"], pipeline_id="",
                                                                   task_type=pipeline_task_type,
                                                                   fake_document_ids=task_document_ids)
+        if has_canceled(task_id):
+            clear_canceled(task_id)
 
     redis_msg.ack()
 
