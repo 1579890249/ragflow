@@ -11,6 +11,7 @@
 
 import argparse
 import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import urllib.request
 from typing import Union
 
@@ -18,7 +19,7 @@ import nltk
 from huggingface_hub import snapshot_download
 
 
-def get_urls(use_china_mirrors=False) -> list[Union[str, list[str]]]:
+def get_urls(use_china_mirrors=True) -> list[Union[str, list[str]]]:
     if use_china_mirrors:
         return [
             "http://mirrors.tuna.tsinghua.edu.cn/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb",
