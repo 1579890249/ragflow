@@ -77,7 +77,7 @@ class RAGFlowPptParser:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
-                timeout=120,
+                timeout=600,
             )
         except FileNotFoundError:
             raise RuntimeError(
@@ -361,7 +361,7 @@ class PPTXToImageConverter:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
-                timeout=120,
+                timeout=600,
             )
             stderr_text = result.stderr.decode(errors="replace")
             stdout_text = result.stdout.decode(errors="replace")
